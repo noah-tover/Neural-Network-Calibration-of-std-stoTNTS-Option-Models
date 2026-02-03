@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.base import BaseEstimator
 import gc
@@ -299,3 +300,140 @@ class optionnet(BaseEstimator):
         torch.cuda.empty_cache()
 
         return neg_log_loss.item()
+#################################################
+class calibrationnet(BaseEstimator):
+    def __init__(
+        self,
+        lr=1e-2,
+        momentum=0.0,
+        nodes=58,
+        hidden_layers=2,
+        batch_size=70000,
+        epochs=100,
+        seed=None
+    ):
+        self.lr = lr
+        self.momentum = momentum
+        self.nodes = nodes
+        self.hidden_layers = hidden_layers
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.seed = seed
+
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+
+    def fit(self, X, y):
+        X, y = tensor_standardize(X, y)
+
+        dataset = TensorDataset(X, y)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+
+        self.model_ = make_optionnet(
+            input_dim=X.shape[1],
+            nodes=self.nodes,
+            hidden_layers=self.hidden_layers
+        ).to(X.device)
+
+        optimizer = torch.optim.SGD(
+            self.model_.parameters(),
+            lr=self.lr,
+            momentum=self.momentum
+        )
+
+        criterion = nn.MSELoss()
+
+        self.model_.train()
+        for _ in range(self.epochs):
+            for X_batch, y_batch in loader:
+                optimizer.zero_grad()
+                preds = self.model_(X_batch)
+                loss = criterion(preds, y_batch)
+                loss.backward()
+                optimizer.step()
+
+        return self
+
+    def fit_with_curves(self, X_train, y_train, X_val, y_val, model=None):
+        X_train, y_train = tensor_standardize(X_train, y_train)
+        X_val, y_val = tensor_standardize(X_val, y_val)
+
+        train_dataset = TensorDataset(X_train, y_train)
+        val_dataset = TensorDataset(X_val, y_val)
+
+        train_loader = DataLoader(
+            train_dataset, batch_size=self.batch_size, shuffle=True
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=self.batch_size, shuffle=False
+        )
+
+        if model is None:
+            self.model_ = make_optionnet(
+                input_dim=X_train.shape[1],
+                nodes=self.nodes,
+                hidden_layers=self.hidden_layers
+            ).to(X_train.device)
+        else:
+            self.model_ = model
+
+        optimizer = torch.optim.SGD(
+            self.model_.parameters(),
+            lr=self.lr,
+            momentum=self.momentum
+        )
+        criterion = nn.MSELoss()
+
+        train_losses = []
+        val_losses = []
+
+        for _ in range(self.epochs):
+            self.model_.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for X_batch, y_batch in val_loader:
+                    preds = self.model_(X_batch)
+                    batch_loss = criterion(preds, y_batch)
+                    val_loss += batch_loss * X_batch.size(0)
+
+            val_loss /= len(val_dataset)
+            val_losses.append(val_loss.item())
+
+            self.model_.train()
+            train_loss = 0.0
+            for X_batch, y_batch in train_loader:
+                optimizer.zero_grad()
+                preds = self.model_(X_batch)
+                loss = criterion(preds, y_batch)
+                loss.backward()
+                optimizer.step()
+
+                train_loss += loss * X_batch.size(0)
+
+            train_loss /= len(train_dataset)
+            train_losses.append(train_loss.item())
+
+        del optimizer, train_dataset, val_dataset, train_loader, val_loader
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        return train_losses, val_losses, self.model_
+
+    def score(self, X, y):
+
+        self.model_.eval()
+
+        X, y = tensor_standardize(X, y)
+
+        criterion = nn.MSELoss()
+
+        with torch.no_grad():
+            preds = self.model_(X)
+            mse = criterion(preds, y)
+            score = -mse # For scikit learn compatibility - maximizes.
+
+        del X, y
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        return score.item()
