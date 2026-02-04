@@ -50,15 +50,13 @@ def gensamplerfoptionprices_gpu( sample_prices, *, r, moneyness, dt = 1/252 ) ->
 ###########################################################
 def simulateHaltonVectors(n=9000000, sim_B=False):
     n += 20 # Add 20 extra rows for later discarding (fix for halton dependence issue)
-    dim = 12 if sim_B else 11
+    dim = 14 if sim_B else 11
     # Generate Halton sequence for main parameters
     sampler = qmc.Halton(d=dim, scramble=True)
     halton_points = sampler.random(n)
-    # Generate an independent uniform(0,0.03) dividend column
-    rng = np.random.default_rng(seed=12345) # Fixed seed for reproducibility
-    dividend = rng.uniform(0, 0.03, size=n)
     # 1. alpha: Uniform(0,1) -> (0,2)
     halton_points[:, 0] = 2 * halton_points[:, 0]
+    halton_points[:, 0][halton_points[:, 0] == 2] = 2 - .0001 # Prevent div by 0 in beta
     # 2. theta: Exponential with mean 1.2544 (rate = 1/mean)
     halton_points[:, 1] = -np.log(1 - halton_points[:, 1]) * 1.2544
     # 3. a1: Uniform(-1,1), no exact 0s
@@ -80,25 +78,23 @@ def simulateHaltonVectors(n=9000000, sim_B=False):
     halton_points[:, 8] = 0.05405997595 * 2 * halton_points[:, 8] - 0.05405997595
     halton_points[:, 8][halton_points[:, 8] == 0] = np.finfo(float).eps
     # 10. rf: Uniform(0.0001,0.05)
-    halton_points[:, 9] = 0.0001 + (0.05 - 0.0001) * halton_points[:, 10]
-    # Append dividend column after rf (index 11), before sim_B columns
+    halton_points[:, 9] = 0.0001 + (0.05 - 0.0001) * halton_points[:, 9]
+    # 11. Dividend
+    halton_points[:, 10] = .03 * halton_points[:, 10]
     if sim_B:
         # B: Uniform(-1,1) + beta and gamma
-        halton_points[:, 10] = 2 * halton_points[:, 10] - 1
-        halton_points[:, 10][halton_points[:, 10] == 0] = np.finfo(float).eps
-        beta = halton_points[:, 10] * np.sqrt(2 * halton_points[:, 1] / (2 - halton_points[:, 0]))
-        gamma = 1 - halton_points[:, 10] ** 2
-        halton_points = np.hstack([
-            halton_points, beta[:, None], gamma[:, None]
-        ])
+        halton_points[:, 11] = 2 * halton_points[:, 11] - 1
+        halton_points[:, 11][halton_points[:, 11] == 0] = np.finfo(float).eps
+        # 13: Beta
+        halton_points[:, 12] = halton_points[:, 11] * np.sqrt(2 * halton_points[:, 1] / (2 - halton_points[:, 0]))
+        # 14: Gamma
+        halton_points[:, 13] = 1 - halton_points[:, 11] ** 2
         # Insert dividend column
-        halton_points = np.hstack([halton_points[:, :10], dividend[:, None], halton_points[:, 10:]])
         columns = [
             "alpha", "theta", "a1", "moneyness", "tao", "kappa", "xi", "zeta", "sigma_error", "rf", "dividend", "B", "betas", "gammas"
         ]
     else:
         # Insert dividend column after rf (index 11)
-        halton_points = np.hstack([halton_points[:, :11], dividend[:, None]])
         columns = [
             "alpha", "theta", "a1", "moneyness", "tao", "kappa", "xi", "zeta", "sigma_error", "rf", "dividend"
         ]
