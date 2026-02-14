@@ -29,6 +29,9 @@ class MELU(nn.Module):
 
         return out
 ############################################################################################
+def phi_lambda(x, lam, m):
+    return lam * (torch.clamp(x, min = 0) ** m)
+#############################################################################################
 def custom_loss(
     model,
     inputs,
@@ -38,14 +41,12 @@ def custom_loss(
     lam2=1.0, m2=3,
     lam3=1.0, m3=3,
     output_loss = True, 
-    log_loss = False
 ):
     '''
     Soft constrained loss function sourced from "Deep learning calibration of option pricing models: some pitfalls and solutions" by Andrew Itkin. Contains piecewise functions which are 0 when constraints are not violated, and nonzero otherwise.
     NOTE: M_i must be at least 3, as the penalty functions are at least m-1 times differentiable and is differentiated at most twice. 
     feature_cols: the column names corresponding to the input tensor. the index of the column names coincides to the column index of their respective data in the tensor.
     output_loss: specifies whether to return the loss itself or the components of the loss. used for gradient scaling.
-    log_loss: specifies whether the loss should be logged. False by default. Logging the loss scales the terms to have equal impact on training and is proven equivalent to one step gradient descent where the scale is a learnable parameter (IMTL-L in "Towards Impartial Multitask Learning by Liu et al.) in the paper "Dual-Balancing for Multitask Learning by Lin et al. 
     '''
     inputs = inputs.requires_grad_(True)
     call_pred = model(inputs)
@@ -75,10 +76,12 @@ def custom_loss(
     reg2 = phi_lambda(-dC_dt, lam2, m2).mean()
     reg3 = phi_lambda(dC_dm, lam3, m3).mean()
     if output_loss == True:
-        loss = mse_loss + reg1 + reg2 + reg3
+        loss = torch.log(mse_loss + reg1 + reg2 + reg3)
         return loss
+       
     else:
         return mse_loss, reg1, reg2, reg3
+
 
 ############################################################################################
 class make_optionnet(nn.Module):
