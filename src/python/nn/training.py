@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.base import BaseEstimator
 import gc
-from architecture import custom_loss, make_optionnet
+from architecture import custom_loss, make_optionnet, dual_balancer
 ##########################################################
 def tensor_standardize(X, y):
     """
@@ -14,46 +14,6 @@ def tensor_standardize(X, y):
     y_scaled = (y - y.mean(dim=0, keepdim=True)) / y.std(dim=0, unbiased=False, keepdim=True)
     return X_scaled, y_scaled
 ##########################################################
-def combine_and_scale_gradients(grad_list):
-    """
-    Scales a list of gradients by each of their magnitudes. Rescales them by the largest magnitude. 
-    grad_list: list of gradient tuples (one tuple per loss)
-    Returns a list of tensors matching model.parameters()
-    """
-    def normalize_and_scale(grads):
-        """
-        Normalize a list of gradients by their total L2 norm.
-        Returns normalized grads and the norm.
-        """
-        flat = torch.cat([g.flatten() for g in grads])
-        norm = flat.norm() + 1e-12  # avoid division by zero. i dont know if this is an actual issue im just being careful.
-        normalized = [g / norm for g in grads]
-        return normalized, norm
-    
-    norms = []
-    normalized_grads = []
-    
-    # Normalize each gradient tuple
-    for grads in grad_list:
-        normed, norm = normalize_and_scale(grads)
-        normalized_grads.append(normed)
-        norms.append(norm)
-    
-    max_norm = max(norms)
-    
-    # Scale by max norm
-    scaled_grads = []
-    for grads in normalized_grads:
-        scaled_grads.append([g * max_norm for g in grads])
-    
-    # Sum gradients element-wise
-    grads_sum = []
-    for params in zip(*scaled_grads):
-        grads_sum.append(sum(params))
-    
-    return grads_sum
-##########################################################
-
 class optionnet(BaseEstimator):
     """
     Neural network model for surrogate modelling of option pricing models. Designed to enforce arbitrage free constraints 
@@ -148,11 +108,12 @@ class optionnet(BaseEstimator):
         optimizer = torch.optim.SGD(
             self.model_.parameters(),
             lr=self.lr,
-            momentum=self.momentum
+            momentum=0 # EMA is tracked inside of balancer.
         )
-
+        
+        balancer = dual_balancer(self.model_, momentum = self.momentum)
+        self.model_.train() # This is just for future proofing in case the model architecture changes.
         for _ in range(self.epochs):
-            self.model_.train()
             for X_batch, y_batch in loader:                
 
                 mse_loss, reg1, reg2, reg3 = custom_loss(
@@ -160,27 +121,13 @@ class optionnet(BaseEstimator):
                     X_batch,
                     y_batch,
                     self.feature_cols,
-                    output_loss=False
+                    output_loss=False,
                 )
 
-                grads_mse = torch.autograd.grad(mse_loss, self.model_.parameters(), retain_graph=True)
-                grads_reg1 = torch.autograd.grad(reg1, self.model_.parameters(), retain_graph=True)
-                grads_reg2 = torch.autograd.grad(reg2, self.model_.parameters(), retain_graph=True)
-                grads_reg3 = torch.autograd.grad(reg3, self.model_.parameters(), retain_graph = False)
-
-                with torch.no_grad():
-                    grads_final = combine_and_scale_gradients(
-                        [grads_mse, grads_reg1, grads_reg2, grads_reg3]
-                    )
-    
-                    total_unlogged_loss = mse_loss + reg1 + reg2 + reg3
-                    grads_final = [g / total_unlogged_loss for g in grads_final]
-                    
-
-                optimizer.zero_grad() # Manually adding gradients, ensure optimizer has no influence outside of lr and momentum.
-                for p, g in zip(self.model_.parameters(), grads_final):
-                    p.grad = g
+                optimizer.zero_grad()
+                balancer.backward([mse_loss, reg1, reg2, reg3])
                 optimizer.step()
+
 
     def fit_with_curves(self, X_train, y_train, X_val, y_val, model = None):
         
@@ -204,27 +151,18 @@ class optionnet(BaseEstimator):
         optimizer = torch.optim.SGD(
             self.model_.parameters(),
             lr=self.lr,
-            momentum=self.momentum
+            momentum=0 # EMA controlled by balancer
         )
         train_losses = []
         val_losses = []
+        balancer = dual_balancer(self.model_, momentum = self.momentum)
         for _ in range(self.epochs):
             epoch_train_loss = 0.0
             epoch_val_loss = 0.0 
             
+            ## TRAIN ##
             
-            for X_batch, y_batch in val_loader:
-                X_batch = X_batch.clone().detach().requires_grad_(True)
-                y_batch = y_batch.clone().detach()
-                
-                # Compute validation loss (no backward)
-                batch_loss = custom_loss(self.model_, X_batch, y_batch, self.feature_cols, output_loss=True)
-                epoch_val_loss += batch_loss * X_batch.size(0)
-            
-            epoch_val_loss /= len(val_dataset)
-            val_losses.append(epoch_val_loss.item())
-            
-            self.model_.train()
+            self.model_.train() # Not necessary, but just future proofing for if batch norm/other methods used.
             
             for X_batch, y_batch in train_loader:                
 
@@ -233,36 +171,37 @@ class optionnet(BaseEstimator):
                     X_batch,
                     y_batch,
                     self.feature_cols,
-                    output_loss=False
+                    output_loss=False,
                 )
-
-                grads_mse = torch.autograd.grad(mse_loss, self.model_.parameters(), retain_graph=True)
-                grads_reg1 = torch.autograd.grad(reg1, self.model_.parameters(), retain_graph=True)
-                grads_reg2 = torch.autograd.grad(reg2, self.model_.parameters(), retain_graph=True)
-                grads_reg3 = torch.autograd.grad(reg3, self.model_.parameters(), retain_graph = False)
-
+                
                 with torch.no_grad():
-                    grads_final = combine_and_scale_gradients(
-                        [grads_mse, grads_reg1, grads_reg2, grads_reg3]
-                    )
-    
-                    total_unlogged_loss = mse_loss + reg1 + reg2 + reg3
-                    grads_final = [g / total_unlogged_loss for g in grads_final]
-                    epoch_train_loss += total_unlogged_loss * X_batch.size(0)
+                    total_loss = torch.log(mse_loss + reg1 + reg2 + reg3)
+                    epoch_train_loss += total_loss * X_batch.size(0)
                     
-
-                optimizer.zero_grad() # Manually adding gradients, ensure optimizer has no influence.
-                for p, g in zip(self.model_.parameters(), grads_final):
-                    p.grad = g
+                
+                optimizer.zero_grad()
+                balancer.backward([mse_loss, reg1, reg2, reg3])
                 optimizer.step()
+                
             epoch_train_loss /= len(train_dataset)
             train_losses.append(epoch_train_loss.item())
             
+            ## TEST ##
+            self.model_.eval()
+            
+            for X_batch, y_batch in val_loader:
+                # This tracks losses without influencing training as gradients part of loss.
+                X_batch = X_batch.clone().detach().requires_grad_(True)
+                y_batch = y_batch.clone().detach()
+                batch_loss = custom_loss(self.model_, X_batch, y_batch, self.feature_cols, output_loss=True)
+                epoch_val_loss += batch_loss * X_batch.size(0)
+            
+            epoch_val_loss /= len(val_dataset)
+            val_losses.append(epoch_val_loss.item())
 
             
         del batch_loss, mse_loss, reg1, reg2, reg3, 
         del optimizer
-        del grads_mse, grads_reg1, grads_reg2, grads_reg3
         del train_dataset, train_loader, val_dataset, val_loader
         del X_train, y_train, X_val, y_val
         gc.collect()
@@ -272,9 +211,9 @@ class optionnet(BaseEstimator):
  
 
 
-    def score(self, X, y):
+    def score(self, X, y, negative = True):
         """
-        Returns negative log loss for sklearn maxxing. 
+        Returns loss. Default log loss and negative for sklearn compatibility.
         """
         self.model_.eval()
         
@@ -284,22 +223,24 @@ class optionnet(BaseEstimator):
         y = y.clone().detach()
         
     
-        mse_loss, reg1, reg2, reg3 = custom_loss(
+        loss = custom_loss(
             self.model_,
             X,
             y,
             self.feature_cols,
-            output_loss=False
+            output_loss=True
         )
-        with torch.no_grad():
-            neg_log_loss = -torch.log(mse_loss + reg1 + reg2 + reg3)
+        if negative == True:
+            with torch.no_grad():
+                loss = -1 * loss
+
+            
         del self.model_
-        del mse_loss, reg1, reg2, reg3
         del X, y
         gc.collect()
         torch.cuda.empty_cache()
 
-        return neg_log_loss.item()
+        return loss.item()
 #################################################
 class calibrationnet(BaseEstimator):
     def __init__(
