@@ -126,4 +126,88 @@ class make_optionnet(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+############################################################################################
+class dual_balancer:
+    """
+    Dual balancing algorithm. 
+    """
 
+    def __init__(self, model, momentum=0.9, eps=1e-12):
+        self.model = model
+        self.momentum = momentum
+        self.eps = eps
+
+        # EMA storage: list (per loss) of lists (per parameter)
+        self.ema_grads = None
+
+    def _init_ema(self, grad_list):
+        self.ema_grads = [
+            [torch.zeros_like(g) for g in grads]
+            for grads in grad_list
+        ]
+
+    def _update_ema(self, grad_list):
+        if self.ema_grads is None:
+            self._init_ema(grad_list)
+
+        updated = []
+        for loss_idx, grads in enumerate(grad_list):
+            ema_for_loss = []
+            for p_idx, g in enumerate(grads):
+                ema = self.ema_grads[loss_idx][p_idx]
+                ema.mul_(self.momentum).add_(g, alpha=1 - self.momentum)
+                ema_for_loss.append(ema)
+            updated.append(ema_for_loss)
+
+        return updated
+
+    def _normalize(self, grads):
+        norm = torch.sqrt(sum((g**2).sum() for g in grads) + self.eps)
+        return [g / norm for g in grads], norm
+
+    def _combine(self, grad_list):
+        norms = []
+        normalized = []
+
+        for grads in grad_list:
+            normed, norm = self._normalize(grads)
+            normalized.append(normed)
+            norms.append(norm)
+
+        max_norm = max(norms)
+
+        scaled = [
+            [g * max_norm for g in grads]
+            for grads in normalized
+        ]
+
+        return [sum(params) for params in zip(*scaled)]
+
+
+    def backward(self, loss_components):
+        """
+        loss_components: iterable of scalar losses
+        """
+
+        grad_list = [
+            torch.autograd.grad(
+                loss,
+                self.model.parameters(),
+                retain_graph=(i < len(loss_components) - 1)
+            )
+            for i, loss in enumerate(loss_components)
+        ]
+
+        grad_list = self._update_ema(grad_list)
+
+        with torch.no_grad():
+            grads_final = self._combine(grad_list)
+
+            total_loss = sum(loss_components)
+            # Manual gradient of the log loss. Via the chain rule, 1/total_loss * sum of individual gradients. 
+            # This is made manual because pytorch doesnt allow you to take the gradient of each individual term in a composite loss.
+            grads_final = [g / total_loss for g in grads_final]
+
+        # Assign gradients
+        for p, g in zip(self.model.parameters(), grads_final):
+            p.grad = g
